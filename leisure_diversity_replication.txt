@@ -1,0 +1,461 @@
+# ============================================================
+# Leisure Diversity & Well-being — Full Replication + Robustness
+# 数据来源：Jamovi .omv 文件（已下载到本地）
+# 流程：读取 .omv -> 构造长表 -> 休闲多样性 -> LMM（作者风格）
+#      -> 朴素中介（忽略聚类：复现作者做法）
+#      -> 多层中介（brms）
+#      -> Shannon/Evenness 敏感性分析
+#      -> 导出结果表到 ./_derived/
+# 备注：脚本为“稳健版”，尽量自动识别变量，必要时在【手动映射区】改两行即可。
+# ============================================================
+
+# ---- 0) 环境与依赖 ----
+set.seed(20251005)
+options(stringsAsFactors = FALSE)
+options(mc.cores = max(1L, parallel::detectCores() - 1L))
+
+ensure_packages <- function(pkgs){
+  inst <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if(length(inst)) install.packages(inst, repos = "https://cloud.r-project.org")
+  invisible(lapply(pkgs, require, character.only = TRUE))
+}
+
+ensure_packages(c(
+  "jmvReadWrite","janitor","dplyr","tidyr","readr","purrr","tibble",
+  "lme4","lmerTest","broom","broom.mixed","mediation","brms",
+  "posterior","bayestestR","stats","utils","clubSandwich","sandwich","lmtest"
+))
+
+# ---- 1) 读取 Jamovi .omv 数据 ----
+# 请确认路径：建议用正斜杠或双反斜杠
+# ⚠️ 如需更换路径，仅需改下一行 data_path
+
+data_path <- "D:/2026 R tmp/Jamovi Datafile Lockdown Blasche Repository.omv"
+
+read_any <- function(p){
+  ext <- tolower(tools::file_ext(p))
+  if (ext == "omv") {
+    fn <- get("read_omv", asNamespace("jmvReadWrite"))
+    out <- tryCatch({
+      if ("fleInp" %in% names(formals(fn))) jmvReadWrite::read_omv(fleInp = p, sveAtt = TRUE)
+      else jmvReadWrite::read_omv(fleNme = p, sveAtt = TRUE)
+    }, error = function(e){ stop("读取 .omv 失败：", e$message) })
+    out <- as.data.frame(out)
+    out[] <- lapply(out, function(x) if (is.factor(x)) as.character(x) else x)
+    return(out)
+  } else if (ext == "csv") {
+    return(readr::read_csv(p, guess_max = 10000))
+  } else if (ext == "sav") {
+    return(haven::read_sav(p))
+  } else {
+    stop("不支持的文件类型：", ext)
+  }
+}
+
+raw <- read_any(data_path)
+raw <- janitor::clean_names(raw)
+message("[data] .omv 已读入；维度：", paste(dim(raw), collapse = " x "))
+message("[data] 列名示例：", paste(head(names(raw), 20), collapse = ", "))
+
+# ---- 2) stringr 兼容性 shim（未安装时用 baseR 代替） ----
+if (!requireNamespace("stringr", quietly = TRUE)) {
+  str_detect <- function(x, pattern) grepl(pattern, x, ignore.case = TRUE)
+  str_remove <- function(x, pattern) sub(pattern, "", x, ignore.case = TRUE)
+  str_to_lower <- function(x) tolower(x)
+} else {
+  str_detect <- stringr::str_detect
+  str_remove <- stringr::str_remove
+  str_to_lower <- stringr::str_to_lower
+}
+
+# ---- 3) 变量自动识别与构造 ----
+
+df <- raw
+all_names <- names(df)
+
+# 3.1 ID 与时间
+id_var <- if ("person" %in% all_names) "person" else {
+  cand <- all_names[str_detect(all_names, "(^id$|^pid$|^subject$)")]
+  if (length(cand)) cand[1] else { df$person <- seq_len(nrow(df)); "person" }
+}
+
+# messung 通常是测量批次（T1/T2）
+time_var <- if ("messung" %in% all_names) "messung" else {
+  cand <- all_names[str_detect(all_names, "^(time|t|assessment_time)$")]
+  if (length(cand)) cand[1] else NA_character_
+}
+
+# 标准化时间编码为 0/1
+if (!is.na(time_var)) {
+  time_vec <- df[[time_var]]
+  time_std <- if (is.numeric(time_vec)) {
+    as.integer(time_vec == max(time_vec, na.rm = TRUE))
+  } else {
+    tv <- str_to_lower(as.character(time_vec))
+    as.integer(tv %in% c("t2","2","post","after"))
+  }
+  df$time_std <- time_std
+} else {
+  # 若没有显式时间列，后续通过 _t1/_t2 构造
+  df$time_std <- NA_integer_
+}
+
+# 3.2 结果变量
+who5_var <- if ("well_being" %in% all_names) "well_being" else {
+  cand <- all_names[str_detect(all_names, "^(who5|who_5|well.?being)$")]
+  if (length(cand)) cand[1] else NA_character_
+}
+
+# PSS：优先找 stress_t1 / stress_t2
+pss_t1 <- all_names[str_detect(all_names, "^stress_?t1$")]
+pss_t2 <- all_names[str_detect(all_names, "^stress_?t2$")]
+
+# 3.3 休闲活动条目 lo*_t1 / lo*_t2（稳健法：分别用全部 _t1 与全部 _t2 列计算）
+# 说明：不再要求 T1/T2 列名成对匹配（如 _rc_t1 vs _ed_t2 也可）；
+#       直接对所有以 _t1 结尾的 lo* 列做出现计数，T2 同理。
+base_df <- if (id_var %in% all_names) {
+  dplyr::group_by(df, .data[[id_var]]) |> dplyr::slice(1) |> dplyr::ungroup()
+} else df
+base_names <- names(base_df)
+
+lo_t1 <- base_names[str_detect(base_names, "^lo.*_t1$")]
+lo_t2 <- base_names[str_detect(base_names, "^lo.*_t2$")]
+
+numify <- function(x){
+  if (is.character(x)) {
+    xl <- str_to_lower(x)
+    ifelse(grepl("not at all|从不|無|无", xl), 0,
+           ifelse(grepl("once|一次", xl), 1,
+                  ifelse(grepl("two|three|四|五|six|seven|several", xl), 2,
+                         suppressWarnings(as.numeric(x)))))
+  } else as.numeric(x)
+}
+
+bin_appear <- function(x){ as.numeric(numify(x) > 0) }
+
+have_t1 <- length(lo_t1) >= 5
+have_t2 <- length(lo_t2) >= 5
+
+if (!have_t1 && !have_t2) {
+  warning("[Diversity] 未检测到足够的 lo*_t1/_t2 列，leisure_div 将为 NA。")
+  div_long <- data.frame(person = df[[id_var]], time = df$time_std, leisure_div = NA_real_)
+} else {
+  div_list <- list()
+  if (have_t1) {
+    div_t1 <- rowSums(as.data.frame(lapply(base_df[lo_t1], bin_appear)), na.rm = TRUE)
+    div_list[[length(div_list)+1]] <- data.frame(person = base_df[[id_var]], time = 0L, leisure_div = div_t1)
+  }
+  if (have_t2) {
+    div_t2 <- rowSums(as.data.frame(lapply(base_df[lo_t2], bin_appear)), na.rm = TRUE)
+    div_list[[length(div_list)+1]] <- data.frame(person = base_df[[id_var]], time = 1L, leisure_div = div_t2)
+  }
+  # 若只有某一个时间点能计算，则另一时间点记为 NA，占位合并
+  if (have_t1 && !have_t2) {
+    div_list[[length(div_list)+1]] <- data.frame(person = base_df[[id_var]], time = 1L, leisure_div = NA_real_)
+  }
+  if (!have_t1 && have_t2) {
+    div_list[[length(div_list)+1]] <- data.frame(person = base_df[[id_var]], time = 0L, leisure_div = NA_real_)
+  }
+  div_long <- do.call(rbind, div_list)
+}
+
+message("[Diversity] lo*_t1 列数=", length(lo_t1), "; lo*_t2 列数=", length(lo_t2))
+message("[Diversity] 示例: T1-> ", paste(utils::head(lo_t1, 5), collapse=", "),
+        "; T2-> ", paste(utils::head(lo_t2, 5), collapse=", "))
+
+# 3.4 构造 WHO-5 长表（来自 well_being + messung）（来自 well_being + messung）
+if (!is.na(who5_var) && !is.na(time_var)) {
+  who_long <- df |>
+    dplyr::select(person = dplyr::all_of(id_var), time = .data$time_std, who5 = dplyr::all_of(who5_var)) |>
+    dplyr::filter(!is.na(time)) |>
+    dplyr::distinct()
+} else {
+  stop("缺少 well_being 或 messung，无法构造 WHO-5 长表。请在【手动映射区】指定。")
+}
+
+# 3.5 构造 PSS 长表（优先 stress_t1 / stress_t2）
+if (length(pss_t1) && length(pss_t2)) {
+  pss_long <- rbind(
+    data.frame(person = base_df[[id_var]], time = 0L, pss10 = numify(base_df[[pss_t1[1]]])),
+    data.frame(person = base_df[[id_var]], time = 1L, pss10 = numify(base_df[[pss_t2[1]]]))
+  )
+} else {
+  # 备选：若数据为长表且存在一个 stress 列并随 messung 变化，可在此补充解析逻辑
+  # 为简单起见，若只找到 stress_t1，则 T2 置 NA
+  if (length(pss_t1)) {
+    pss_long <- rbind(
+      data.frame(person = base_df[[id_var]], time = 0L, pss10 = numify(base_df[[pss_t1[1]]])),
+      data.frame(person = base_df[[id_var]], time = 1L, pss10 = NA_real_)
+    )
+    warning("仅检测到 stress_t1，T2 的 PSS 记为 NA。")
+  } else {
+    warning("未检测到 PSS 列（stress_t1/stress_t2），后续 PSS 模型将跳过。")
+    pss_long <- NULL
+  }
+}
+
+# 3.6 协变量（使用 T1 宽表列；若有 *_t2 可自行扩展）
+occ_var   <- if ("quant_demands_t1" %in% base_names) "quant_demands_t1" else NA_character_
+cov_h_col <- if ("covid_worry_health_t1" %in% base_names) "covid_worry_health_t1" else NA_character_
+cov_o_col <- if ("covid_worry_other_t1" %in% base_names) "covid_worry_other_t1" else NA_character_
+sex_var   <- if ("gender" %in% base_names) "gender" else if ("sex" %in% base_names) "sex" else NA_character_
+age_var   <- if ("age" %in% base_names) "age" else NA_character_
+house_var <- NA_character_  # 若数据中有家务/育儿时长列，请在此指定
+
+cov_df <- data.frame(
+  person = base_df[[id_var]],
+  sex  = if (!is.na(sex_var)) base_df[[sex_var]] else NA,
+  age  = if (!is.na(age_var)) base_df[[age_var]] else NA,
+  occ  = if (!is.na(occ_var)) base_df[[occ_var]] else NA,
+  cov_h= if (!is.na(cov_h_col)) base_df[[cov_h_col]] else NA,
+  cov_o= if (!is.na(cov_o_col)) base_df[[cov_o_col]] else NA,
+  stringsAsFactors = FALSE
+)
+
+# 3.7 合并为分析数据 dat
+core_long <- who_long
+if (!is.null(pss_long)) core_long <- dplyr::full_join(core_long, pss_long, by = c("person","time"))
+core_long <- dplyr::full_join(core_long, div_long, by = c("person","time"))
+core_long <- dplyr::left_join(core_long, cov_df, by = c("person"))
+
+dat <- core_long |>
+  dplyr::rename(id = person) |>
+  dplyr::mutate(
+    time = as.integer(time),
+    id   = as.factor(id),
+    sex  = as.factor(sex),
+    across(c(age, occ, cov_h, cov_o, leisure_div, who5, pss10), ~ suppressWarnings(as.numeric(.)))
+  ) |>
+  dplyr::arrange(id, time)
+
+message("[map] dat 维度：", paste(dim(dat), collapse = " x "))
+print(utils::head(dat, 3))
+
+# ---- 4) 作者“当前模型”复现：LMM ----
+mk_formula <- function(y, with_div = FALSE){
+  # 依据 dat 中的有效列动态选择协变量；剔除全 NA 或零方差列
+  rhs <- c("time","age","sex","occ","cov_h","cov_o")
+  if (with_div) rhs <- c(rhs, "leisure_div")
+  rhs <- rhs[rhs %in% names(dat)]
+  if (length(rhs)) {
+    rhs <- rhs[sapply(dat[rhs], function(x) sum(!is.na(x)) > 0)]
+    rhs <- rhs[sapply(dat[rhs], function(x){
+      xv <- x[!is.na(x)]
+      if (length(xv) <= 1) return(FALSE)
+      if (is.factor(xv)) return(nlevels(droplevels(xv)) > 1)
+      suppressWarnings(sd(as.numeric(xv), na.rm = TRUE) > 0)
+    })]
+  }
+  if (!length(rhs)) rhs <- "time"  # 至少包含 time
+  stats::as.formula(paste0(y, " ~ ", paste(rhs, collapse = " + "), " + (1|id)"))
+}
+
+fit_lmm <- function(y_label){
+  d <- dat[!is.na(dat[[y_label]]), ]
+  if (nrow(d) == 0) stop(paste0("变量 ", y_label, " 在 dat 中全为 NA —— 请检查映射/列名。"))
+
+  # 构造 RHS 变量（不含随机项）；只保留存在且有变异的列
+  select_rhs <- function(with_div = FALSE){
+    rhs <- c("time","age","sex","occ","cov_h","cov_o")
+    if (with_div) rhs <- c(rhs, "leisure_div")
+    rhs <- rhs[rhs %in% names(d)]
+    if (length(rhs)) {
+      rhs <- rhs[sapply(d[rhs], function(x) sum(!is.na(x)) > 0)]
+      rhs <- rhs[sapply(d[rhs], function(x){
+        xv <- x[!is.na(x)]
+        if (length(xv) <= 1) return(FALSE)
+        if (is.factor(xv)) return(nlevels(droplevels(xv)) > 1)
+        suppressWarnings(sd(as.numeric(xv), na.rm = TRUE) > 0)
+      })]
+    }
+    if (!length(rhs)) rhs <- "time"
+    rhs
+  }
+
+  rhs1 <- select_rhs(FALSE)
+  rhs3 <- select_rhs(TRUE)
+
+  f1_lmer <- stats::as.formula(paste0(y_label, " ~ ", paste(rhs1, collapse = " + "), " + (1|id)"))
+  f3_lmer <- stats::as.formula(paste0(y_label, " ~ ", paste(rhs3, collapse = " + "), " + (1|id)"))
+  f1_ols  <- stats::as.formula(paste0(y_label, " ~ ", paste(rhs1, collapse = " + ")))
+  f3_ols  <- stats::as.formula(paste0(y_label, " ~ ", paste(rhs3, collapse = " + ")))
+
+  message("[LMM] 模型1:", deparse(f1_lmer))
+  # 是否具备混合模型最小条件：至少有一个 id 拥有 ≥2 条记录
+  has_repeat <- any(table(d$id) >= 2)
+  m1 <- try(if (has_repeat) lme4::lmer(f1_lmer, data = d, REML = FALSE) else stop("no_repeat"), silent = TRUE)
+  if (inherits(m1, "try-error")) {
+    message("[LMM] ", y_label, ": 不满足混合模型条件或拟合失败，回退 OLS（cluster-robust by id）。")
+    m1 <- stats::lm(f1_ols, data = d)
+    attr(m1, "cluster_id") <- d$id
+  }
+
+  message("[LMM] 模型3:", deparse(f3_lmer))
+  has_repeat3 <- any(table(d$id) >= 2)
+  m3 <- try(if (has_repeat3) lme4::lmer(f3_lmer, data = d, REML = FALSE) else stop("no_repeat"), silent = TRUE)
+  if (inherits(m3, "try-error")) {
+    m3 <- stats::lm(f3_ols, data = d)
+    attr(m3, "cluster_id") <- d$id
+  }
+  list(m1 = m1, m3 = m3)
+}
+
+  message("[LMM] 模型3:", deparse(f3))
+  m3 <- try(lme4::lmer(f3, data = d, REML = FALSE), silent = TRUE)
+  if (inherits(m3, "try-error") || length(unique(d$id)) >= nrow(na.omit(model.frame(f3, d)))) {
+    rhs3 <- attr(terms(f3), "term.labels")
+    f3_ols <- stats::as.formula(paste0(y_label, " ~ ", paste(rhs3[!grepl("\\(1\\|id\\)", rhs3)], collapse = " + ")))
+    m3 <- stats::lm(f3_ols, data = d)
+    attr(m3, "cluster_id") <- d$id
+  }
+  list(m1 = m1, m3 = m3)
+}
+
+fit_who <- fit_lmm("who5")
+if (!all(is.na(dat$pss10))) fit_pss <- fit_lmm("pss10") else fit_pss <- NULL
+
+sum_tbl <- function(mod, label){
+  if (inherits(mod, "lmerMod")) {
+    out <- broom.mixed::tidy(mod, effects = "fixed", conf.int = TRUE)
+    out <- dplyr::select(out, term, estimate, conf.low, conf.high, p.value)
+  } else if (inherits(mod, "lm")) {
+    cl <- attr(mod, "cluster_id")
+    if (!is.null(cl)) {
+      ct <- clubSandwich::coef_test(mod, vcov = "CR2", cluster = cl)
+      out <- data.frame(
+        term = rownames(ct),
+        estimate = ct$beta,
+        conf.low = ct$CI_L,
+        conf.high = ct$CI_U,
+        p.value = ct$p_Satt,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      out <- broom::tidy(mod, conf.int = TRUE)
+      out <- dplyr::select(out, term, estimate, conf.low, conf.high, p.value)
+    }
+  } else {
+    stop("未知模型类型：", class(mod)[1])
+  }
+  dplyr::mutate(out, model = label)
+}
+
+tab_fix <- dplyr::bind_rows(
+  sum_tbl(fit_who$m1, "WHO5: time+cov"),
+  sum_tbl(fit_who$m3, "WHO5: time+cov+div"),
+  if (!is.null(fit_pss)) sum_tbl(fit_pss$m1, "PSS10: time+cov") else NULL,
+  if (!is.null(fit_pss)) sum_tbl(fit_pss$m3, "PSS10: time+cov+div") else NULL
+)
+print(tab_fix)
+
+# ---- 5) 朴素中介（忽略聚类，复现作者风格） ----
+mk_lm_med <- function(y){
+  covs <- c("age","sex","occ","cov_h","cov_o")
+  covs <- covs[covs %in% names(dat)]
+  if (length(covs)) covs <- covs[sapply(dat[covs], function(x) sum(!is.na(x)) > 0)]
+  if (!length(covs)) {
+    fm_m <- stats::as.formula("leisure_div ~ time")
+    fm_y <- stats::as.formula(paste0(y, " ~ time + leisure_div"))
+  } else {
+    fm_m <- stats::as.formula(paste0("leisure_div ~ time + ", paste(covs, collapse = " + ")))
+    fm_y <- stats::as.formula(paste0(y,           " ~ time + leisure_div + ", paste(covs, collapse = " + ")))
+  }
+  list(fm_m = fm_m, fm_y = fm_y)
+}
+
+run_naive_mediation <- function(y, label){
+  fm <- mk_lm_med(y)
+  # 若 y 或中介/时间在完整案例中无变异，则跳过
+  cc <- complete.cases(dat[, all.vars(fm$fm_m)]) & complete.cases(dat[, all.vars(fm$fm_y)])
+  dsub <- dat[cc, ]
+  if (nrow(dsub) == 0 || length(unique(dsub$time)) < 2) {
+    message("[MED] ", label, ": 可用数据不足（可能只有 T1），跳过朴素中介。")
+    return(NULL)
+  }
+  fit.m <- stats::lm(fm$fm_m, data = dsub)
+  fit.y <- stats::lm(fm$fm_y, data = dsub)
+  med   <- mediation::mediate(fit.m, fit.y, treat = "time", mediator = "leisure_div",
+                              boot = TRUE, sims = 5000)
+  out <- data.frame(
+    outcome = label,
+    ACME_est = med$d0,  ACME_ci_lo = med$d0.ci[1], ACME_ci_hi = med$d0.ci[2], ACME_p = med$d0.p,
+    ADE_est  = med$z0,  ADE_ci_lo  = med$z0.ci[1], ADE_ci_hi  = med$z0.ci[2], ADE_p  = med$z0.p,
+    Total    = med$tau.coef,  Total_ci_lo = med$tau.ci[1], Total_ci_hi = med$tau.ci[2],
+    Prop_med = med$n0
+  )
+  print(out)
+  invisible(out)
+}
+
+med_tab <- dplyr::bind_rows(
+  run_naive_mediation("who5",  "WHO5"),
+  if (!is.null(fit_pss)) run_naive_mediation("pss10", "PSS10") else NULL
+)
+
+# ---- 6) 多层中介（brms） ----
+run_brms_med <- function(y, label, iter = 2000, chains = 4){
+  rhs_cov <- paste(c("time","age","sex","occ","cov_h","cov_o"), collapse = " + ")
+  bf_m <- brms::bf(stats::as.formula(paste0("leisure_div ~ ", rhs_cov, " + (1|p|id)")))
+  bf_y <- brms::bf(stats::as.formula(paste0(y,            " ~ time + leisure_div + age + sex + occ + cov_h + cov_o + (1|p|id)")))
+  fit <- brms::brm(
+    bf_m + bf_y + brms::set_rescor(FALSE),
+    data = dat, family = gaussian(), seed = 20251005,
+    chains = chains, iter = iter, refresh = 0,
+    control = list(adapt_delta = 0.95, max_treedepth = 12)
+  )
+  # 间接效应：b_leisure_div_time * b_{y}_leisure_div
+  hyp <- paste0("indirect = b_leisure_div_time * b_", y, "_leisure_div")
+  h   <- brms::hypothesis(fit, hyp)
+  summ<- as.data.frame(h$hypothesis)
+  summ$outcome <- label
+  print(summ[, c("outcome","Hypothesis","Estimate","CI.Lower","CI.Upper","Evid.Ratio","Post.Prob")])
+  list(fit = fit, hyp = summ)
+}
+
+br_who <- run_brms_med("who5", "WHO5")
+br_pss <- if (!is.null(fit_pss)) run_brms_med("pss10", "PSS10") else NULL
+
+# ---- 7) Shannon 多样性与均匀度（敏感性） ----
+if (length(act_pairs) >= 3) {
+  freq_to_weight <- function(x){
+    x <- numify(x)
+    # 若原刻度为 0-5/0-6，此处直接使用；否则用近似权重
+    x
+  }
+  W1 <- as.data.frame(lapply(base_df[lo_t1], freq_to_weight))
+  W2 <- as.data.frame(lapply(base_df[lo_t2], freq_to_weight))
+  W1[is.na(W1)] <- 0; W2[is.na(W2)] <- 0
+  p1 <- sweep(W1, 1, pmax(rowSums(W1), 1e-9), "/")
+  p2 <- sweep(W2, 1, pmax(rowSums(W2), 1e-9), "/")
+  H1 <- -rowSums(p1 * log(pmax(p1, 1e-12)))
+  H2 <- -rowSums(p2 * log(pmax(p2, 1e-12)))
+  S1 <- rowSums(W1 > 0); S2 <- rowSums(W2 > 0)
+  E1 <- H1 / log(pmax(S1, 1))
+  E2 <- H2 / log(pmax(S2, 1))
+  sh_long <- rbind(
+    data.frame(id = base_df[[id_var]], time = 0L, shannon = H1, evenness = E1),
+    data.frame(id = base_df[[id_var]], time = 1L, shannon = H2, evenness = E2)
+  )
+  dat2 <- dplyr::left_join(dat, sh_long, by = c("id","time"))
+  # 示例：在 WHO5 中加入 shannon
+  f_sh <- stats::as.formula("who5 ~ time + age + sex + occ + cov_h + cov_o + shannon + (1|id)")
+  if (all(!is.na(dat2$shannon))) {
+    m_sh <- lme4::lmer(f_sh, data = dat2, REML = FALSE)
+    print(broom.mixed::tidy(m_sh, effects = "fixed", conf.int = TRUE))
+  } else {
+    message("[Shannon] 计算存在 NA，跳过示例 LMM。")
+  }
+} else {
+  message("[Shannon] 未定位到足够的活动频次列，跳过 Shannon 敏感性分析。")
+}
+
+# ---- 8) 导出结果 ----
+dir.create("_derived", showWarnings = FALSE)
+readr::write_csv(tab_fix, "_derived/LMM_fixed_effects.csv")
+readr::write_csv(med_tab, "_derived/Naive_mediation.csv")
+
+br_tab <- br_who$hyp
+if (!is.null(br_pss)) br_tab <- dplyr::bind_rows(br_tab, br_pss$hyp)
+readr::write_csv(br_tab, "_derived/BRMS_indirect_effects.csv")
+
+message("✅ 完成：主要结果已导出到 ./_derived/ ")
